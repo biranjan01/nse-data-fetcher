@@ -1,13 +1,13 @@
 """
-Pure NSE data fetcher — NO processing, NO calculations.
-Just fetches raw option chain JSON from NSE and saves it.
-All processing happens in Vercel (JavaScript).
+NSE Data Fetcher — uses nsefetch (curl_cffi) to bypass Akamai bot detection.
+Fetches option chain data for all F&O stocks and saves compact JSON.
 """
-import nsepythonserver
-from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import time
 from datetime import datetime, timezone
+from nsefetch.config import load_settings
+from nsefetch.client import NSEHttpClient
 
 # All F&O stocks
 FNO_STOCKS = [
@@ -45,58 +45,97 @@ FNO_STOCKS = [
 OUTPUT_DIR = "docs"
 
 
-def fetch_one(symbol):
-    """Fetch raw option chain JSON from NSE — no processing."""
+def fetch_one(client, symbol):
+    """Fetch option chain for a single symbol using nsefetch."""
     try:
-        data = nsepythonserver.nse_optionchain_scrapper(symbol)
-        if data and data.get("records") and data["records"].get("expiryDates"):
-            return symbol, data
+        # Get expiry dates
+        contract_info = client.request_json(
+            "GET", "/api/option-chain-contract-info", params={"symbol": symbol}
+        )
+        expiry_dates = contract_info.get("expiryDates", [])
+        if not expiry_dates:
+            return symbol, None
+
+        nearest_expiry = expiry_dates[0]
+
+        # Determine type (Indices vs Equity)
+        is_index = symbol in {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
+        chain_type = "Indices" if is_index else "Equity"
+
+        # Fetch option chain
+        data = client.request_json(
+            "GET",
+            "/api/option-chain-v3",
+            params={"type": chain_type, "symbol": symbol, "expiry": nearest_expiry},
+        )
+
+        if not data or "records" not in data:
+            return symbol, None
+
+        records = data["records"]
+        underlying = records.get("underlyingValue")
+        raw = records.get("data", [])
+
+        # Filter to nearest expiry only (v3 uses "expiryDates" plural)
+        filtered = [r for r in raw if r.get("expiryDates") == nearest_expiry]
+
+        # Extract compact data
+        strikes = []
+        for row in filtered:
+            ce = row.get("CE", {})
+            pe = row.get("PE", {})
+            strikes.append({
+                "strike": row.get("strikePrice"),
+                "ce_oi": ce.get("openInterest", 0),
+                "ce_change_oi": ce.get("changeinOpenInterest", 0),
+                "ce_vol": ce.get("totalTradedVolume", 0),
+                "pe_oi": pe.get("openInterest", 0),
+                "pe_change_oi": pe.get("changeinOpenInterest", 0),
+                "pe_vol": pe.get("totalTradedVolume", 0),
+            })
+
+        return symbol, {
+            "ltp": underlying,
+            "expiry": nearest_expiry,
+            "strikes": strikes,
+        }
+
     except Exception as e:
         print(f"  FAIL {symbol}: {e}")
-    return symbol, None
+        return symbol, None
 
 
 if __name__ == "__main__":
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    print(f"Fetching {len(FNO_STOCKS)} stocks from NSE...")
+    settings = load_settings()
+    client = NSEHttpClient(settings=settings)
+
+    print(f"Bootstrapping NSE session...")
+    client.bootstrap_session()
+    print(f"Session OK. Fetching {len(FNO_STOCKS)} stocks...")
+
     results = {}
+    success = 0
+    fail = 0
 
-    with ThreadPoolExecutor(max_workers=15) as ex:
-        futures = {ex.submit(fetch_one, s): s for s in FNO_STOCKS}
-        for f in futures:
-            sym, data = f.result()
-            if data:
-                # Extract only what Vercel needs — minimize file size
-                records = data.get("records", {})
-                nearest_expiry = records.get("expiryDates", [None])[0]
-                raw = records.get("data", [])
-                ltp = records.get("underlyingValue")
+    for i, symbol in enumerate(FNO_STOCKS):
+        sym, data = fetch_one(client, symbol)
+        if data:
+            results[sym] = data
+            success += 1
+        else:
+            fail += 1
 
-                # Filter to nearest expiry only
-                filtered = [r for r in raw if r.get("expiryDate") == nearest_expiry]
+        # Progress every 20 stocks
+        if (i + 1) % 20 == 0:
+            print(f"  Progress: {i + 1}/{len(FNO_STOCKS)} (ok={success}, fail={fail})")
 
-                # Extract compact data for each strike
-                strikes = []
-                for row in filtered:
-                    ce = row.get("CE", {})
-                    pe = row.get("PE", {})
-                    strikes.append({
-                        "strike": row.get("strikePrice"),
-                        "ce_oi": ce.get("openInterest", 0),
-                        "ce_change_oi": ce.get("changeinOpenInterest", 0),
-                        "ce_vol": ce.get("totalTradedVolume", 0),
-                        "pe_oi": pe.get("openInterest", 0),
-                        "pe_change_oi": pe.get("changeinOpenInterest", 0),
-                        "pe_vol": pe.get("totalTradedVolume", 0),
-                    })
+        # Small delay to avoid rate limiting
+        time.sleep(0.3)
 
-                results[sym] = {
-                    "ltp": ltp,
-                    "expiry": nearest_expiry,
-                    "strikes": strikes,
-                }
+    client.close()
 
     output = {
         "timestamp": timestamp,
@@ -108,5 +147,6 @@ if __name__ == "__main__":
     with open(path, "w") as f:
         json.dump(output, f)
 
-    print(f"\nSaved {len(results)} stocks to {path}")
+    print(f"\nDone! Saved {len(results)} stocks to {path}")
+    print(f"Success: {success}, Failed: {fail}")
     print(f"Timestamp: {timestamp}")
